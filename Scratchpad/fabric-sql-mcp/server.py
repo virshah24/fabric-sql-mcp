@@ -168,7 +168,7 @@ def _validate_select_query(query: str, *, for_export: bool = False) -> str:
         raise ValueError("Only read-only SELECT queries are allowed.")
     if DANGEROUS_SQL_PATTERN.search(without_trailing_semicolon):
         raise ValueError("Query contains a disallowed SQL keyword.")
-    if not for_export and "information_schema." not in normalized and not re.search(r"\b(top|offset|count\s*\()", normalized):
+    if not for_export and "information_schema." not in normalized and not re.search(r"\b(top|offset|count(?:_big)?\s*\()", normalized):
         raise ValueError("Interactive queries must include TOP, OFFSET/FETCH, or COUNT. Use export for larger result sets.")
     return without_trailing_semicolon
 
@@ -206,7 +206,13 @@ def _connect(
 def _rows_to_dicts(cursor: pyodbc.Cursor, max_rows: int) -> list[dict[str, Any]]:
     columns = [column[0] for column in cursor.description or []]
     rows = cursor.fetchmany(max_rows)
-    return [dict(zip(columns, row)) for row in rows]
+    return [
+        {
+            column: (value.isoformat() if hasattr(value, "isoformat") else value)
+            for column, value in zip(columns, row)
+        }
+        for row in rows
+    ]
 
 
 def _execute_sql(
@@ -290,34 +296,77 @@ def _export_csv(
 
 def _translate_nlp(question: str) -> str:
     normalized = question.lower()
-    asks_city = "city" in normalized or "cities" in normalized
-    if "unit" in normalized and asks_city:
+    top_match = re.search(r"\b(?:top|last|latest)\s+(\d{1,5})\b", normalized)
+    top_n = min(int(top_match.group(1)), 5000) if top_match else 10
+
+    if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table")) and any(
+        term in normalized for term in ("last", "latest", "recent", "show")
+    ):
         return (
-            "SELECT TOP (10) s.City, SUM(f.Units) AS UnitsSold "
+            f"SELECT TOP ({top_n}) f.SaleId, f.[Date], f.StoreId, s.StoreName, s.City, s.Region, "
+            "f.ProductId, p.ProductName, p.Category, p.Brand, f.Units, f.RevenueUSD "
             "FROM dbo.factsales f "
-            "JOIN dbo.dimstore s ON f.StoreId = s.StoreId "
-            "GROUP BY s.City "
-            "ORDER BY UnitsSold DESC"
+            "LEFT JOIN dbo.dimstore s ON f.StoreId = s.StoreId "
+            "LEFT JOIN dbo.dimproduct p ON f.ProductId = p.ProductId "
+            "ORDER BY f.[Date] DESC, f.SaleId DESC"
         )
-    if "unit" in normalized and ("product" in normalized or "sku" in normalized):
+
+    dimension: tuple[str, str, str] | None = None
+    if "city" in normalized or "cities" in normalized:
+        dimension = ("s.City", "City", "dbo.dimstore s ON f.StoreId = s.StoreId")
+    elif "region" in normalized or "country" in normalized:
+        dimension = ("s.Region", "Region", "dbo.dimstore s ON f.StoreId = s.StoreId")
+    elif "store" in normalized:
+        dimension = ("s.StoreName", "StoreName", "dbo.dimstore s ON f.StoreId = s.StoreId")
+    elif "category" in normalized or "categories" in normalized:
+        dimension = ("p.Category", "Category", "dbo.dimproduct p ON f.ProductId = p.ProductId")
+    elif "brand" in normalized:
+        dimension = ("p.Brand", "Brand", "dbo.dimproduct p ON f.ProductId = p.ProductId")
+    elif "product" in normalized or "products" in normalized or "goods" in normalized or "sku" in normalized:
+        dimension = ("p.ProductName", "ProductName", "dbo.dimproduct p ON f.ProductId = p.ProductId")
+    elif "date" in normalized or "day" in normalized or "daily" in normalized:
+        dimension = ("f.[Date]", "Date", "")
+
+    if "average" in normalized or "avg" in normalized:
+        if "unit" in normalized:
+            metric = "AVG(CAST(f.Units AS float))"
+            alias = "AvgUnits"
+        else:
+            metric = "SUM(f.RevenueUSD) / NULLIF(SUM(f.Units), 0)"
+            alias = "AvgSellingPrice"
+    elif "transaction" in normalized or "count" in normalized or "number of sales" in normalized:
+        metric = "COUNT_BIG(*)"
+        alias = "TransactionCount"
+    elif "unit" in normalized or "quantity" in normalized or "sold" in normalized:
+        metric = "SUM(f.Units)"
+        alias = "UnitsSold"
+    else:
+        metric = "SUM(f.RevenueUSD)"
+        alias = "RevenueUSD"
+
+    order_direction = "ASC" if any(term in normalized for term in ("bottom", "lowest", "least", "worst")) else "DESC"
+
+    if dimension:
+        field, alias_dimension, join_clause = dimension
+        join_sql = f"JOIN {join_clause} " if join_clause else ""
         return (
-            "SELECT TOP (10) p.ProductName, SUM(f.Units) AS UnitsSold "
+            f"SELECT TOP ({top_n}) {field} AS {alias_dimension}, {metric} AS {alias} "
             "FROM dbo.factsales f "
-            "JOIN dbo.dimproduct p ON f.ProductId = p.ProductId "
-            "GROUP BY p.ProductName "
-            "ORDER BY UnitsSold DESC"
+            f"{join_sql}"
+            f"GROUP BY {field} "
+            f"ORDER BY {alias} {order_direction}"
         )
-    if "revenue" in normalized and asks_city:
+
+    if "total" in normalized or "summary" in normalized or "overall" in normalized:
         return (
-            "SELECT TOP (10) s.City, SUM(f.RevenueUSD) AS RevenueUSD "
-            "FROM dbo.factsales f "
-            "JOIN dbo.dimstore s ON f.StoreId = s.StoreId "
-            "GROUP BY s.City "
-            "ORDER BY RevenueUSD DESC"
+            "SELECT COUNT_BIG(*) AS TransactionCount, SUM(f.Units) AS UnitsSold, "
+            "SUM(f.RevenueUSD) AS RevenueUSD, SUM(f.RevenueUSD) / NULLIF(SUM(f.Units), 0) AS AvgSellingPrice "
+            "FROM dbo.factsales f"
         )
+
     raise ValueError(
-        "I can translate city/product units and city revenue questions. "
-        "Use fabric_sql_query for custom SQL."
+        "I can translate retail sales questions about transactions, revenue, units, average selling price, "
+        "and breakdowns by city, region, store, product, category, brand, or date. Use fabric_sql_query for custom SQL."
     )
 
 
