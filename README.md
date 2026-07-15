@@ -94,6 +94,7 @@ https://<container-app-host>/demo
 The page lets you:
 
 - enter the MCP bearer/API token,
+- optionally override the Fabric SQL endpoint host and database/catalog,
 - run a sample NLP query,
 - export up to 2,000 rows to CSV through the protected `/demo/export` route.
 

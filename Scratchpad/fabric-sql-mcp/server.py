@@ -418,6 +418,10 @@ async def demo(_: Request) -> Response:
   <section>
     <label>Bearer token / API key</label>
     <input id="token" type="password" placeholder="Paste MCP_AUTH_TOKEN" />
+    <label>Fabric SQL endpoint host</label>
+    <input id="server" placeholder="Use server configured on deployment" />
+    <label>Database / catalog</label>
+    <input id="database" placeholder="Use database configured on deployment" />
     <label>NLP question</label>
     <textarea id="question">Which cities sold the most units?</textarea>
     <button onclick="runNlp()">Run NLP Query</button>
@@ -439,10 +443,16 @@ async def demo(_: Request) -> Response:
   async function runNlp() {
     const output = document.getElementById('output');
     output.textContent = 'Running...';
+    const server = document.getElementById('server').value.trim();
+    const database = document.getElementById('database').value.trim();
     const response = await fetch('/demo/query', {
       method: 'POST',
       headers: authHeaders(),
-      body: JSON.stringify({ question: document.getElementById('question').value })
+      body: JSON.stringify({
+        question: document.getElementById('question').value,
+        server: server || null,
+        database: database || null
+      })
     });
     const payload = await response.json();
     if (response.ok && payload.translatedSql) {
@@ -454,10 +464,14 @@ async def demo(_: Request) -> Response:
   async function exportCsv() {
     const output = document.getElementById('output');
     const question = document.getElementById('question').value;
+    const server = document.getElementById('server').value.trim();
+    const database = document.getElementById('database').value.trim();
     output.textContent = 'Exporting...';
     const requestBody = {
       question,
-      max_rows: 2000
+      max_rows: 2000,
+      server: server || null,
+      database: database || null
     };
     if (lastTranslatedSql && lastQuestion === question) {
       requestBody.query = lastTranslatedSql;
@@ -497,7 +511,14 @@ async def demo_query(request: Request) -> Response:
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
     sql = _translate_nlp(question)
-    result = await asyncio.to_thread(_execute_sql, query=sql, max_rows=100)
+    result = await asyncio.to_thread(
+        _execute_sql,
+        query=sql,
+        database=payload.get("database"),
+        server=payload.get("server"),
+        tenant_id=payload.get("tenant_id"),
+        max_rows=100,
+    )
     result["question"] = question
     result["translatedSql"] = sql
     return JSONResponse(result)
@@ -516,7 +537,15 @@ async def demo_export(request: Request) -> Response:
         source = "translated_question"
     else:
         query = "SELECT TOP (2000) * FROM dbo.factsales ORDER BY [Date] DESC, SaleId DESC"
-    result = await asyncio.to_thread(_export_csv, query=query, max_rows=max_rows, page_size=1000)
+    result = await asyncio.to_thread(
+        _export_csv,
+        query=query,
+        database=payload.get("database"),
+        server=payload.get("server"),
+        tenant_id=payload.get("tenant_id"),
+        max_rows=max_rows,
+        page_size=1000,
+    )
     result["translatedSql"] = query
     result["exportSource"] = source
     return JSONResponse(result)
