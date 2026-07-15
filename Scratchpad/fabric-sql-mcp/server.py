@@ -421,7 +421,7 @@ async def demo(_: Request) -> Response:
     <label>NLP question</label>
     <textarea id="question">Which cities sold the most units?</textarea>
     <button onclick="runNlp()">Run NLP Query</button>
-    <button onclick="exportCsv()">Export 2,000 Rows CSV</button>
+    <button onclick="exportCsv()">Export Current Question CSV</button>
   </section>
   <section>
     <h2>Result</h2>
@@ -449,7 +449,10 @@ async def demo(_: Request) -> Response:
     const response = await fetch('/demo/export', {
       method: 'POST',
       headers: authHeaders(),
-      body: JSON.stringify({ max_rows: 2000 })
+      body: JSON.stringify({
+        question: document.getElementById('question').value,
+        max_rows: 2000
+      })
     });
     const payload = await response.json();
     output.textContent = JSON.stringify(payload, null, 2);
@@ -487,13 +490,14 @@ async def demo_query(request: Request) -> Response:
 async def demo_export(request: Request) -> Response:
     payload = await request.json()
     max_rows = int(payload.get("max_rows", 2000))
-    query = str(
-        payload.get(
-            "query",
-            "SELECT TOP (2000) * FROM dbo.factsales ORDER BY SaleId",
-        )
-    )
+    if payload.get("query"):
+        query = str(payload["query"])
+    elif payload.get("question"):
+        query = _translate_nlp(str(payload["question"]))
+    else:
+        query = "SELECT TOP (2000) * FROM dbo.factsales ORDER BY [Date] DESC, SaleId DESC"
     result = await asyncio.to_thread(_export_csv, query=query, max_rows=max_rows, page_size=1000)
+    result["translatedSql"] = query
     return JSONResponse(result)
 
 
