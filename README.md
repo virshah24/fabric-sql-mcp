@@ -82,3 +82,19 @@ The tool writes CSV files to `FABRIC_SQL_EXPORT_DIR` and returns:
 - `downloadUrl` when `PUBLIC_BASE_URL` is configured
 
 For production, prefer replacing local temporary export storage with Azure Blob Storage and short-lived download URLs.
+
+## Demo chat UI
+
+The deployed container also serves a lightweight demo page:
+
+```text
+https://<container-app-host>/demo
+```
+
+The page lets you:
+
+- enter the MCP bearer/API token,
+- run a sample NLP query,
+- export up to 2,000 rows to CSV through the protected `/demo/export` route.
+
+The demo uses the same server-side guardrails and authentication as the MCP endpoint.

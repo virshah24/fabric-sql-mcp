@@ -21,7 +21,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 import uvicorn
 
 
@@ -46,7 +46,7 @@ class ApiKeyAndRateLimitMiddleware(BaseHTTPMiddleware):
         self.rate_limit_per_minute = rate_limit_per_minute
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
-        if request.method == "OPTIONS" or request.url.path == "/health":
+        if request.method == "OPTIONS" or request.url.path in {"/health", "/demo"}:
             return await call_next(request)
 
         if self.api_key:
@@ -92,12 +92,16 @@ def _get_access_token(tenant_id: str, resource: str = "https://database.windows.
     az = shutil.which("az") or shutil.which("az.cmd")
     if not az:
         try:
-            return AzureCliCredential().get_token(scope).token
+            return AzureCliCredential(tenant_id=tenant_id or "").get_token(scope).token
         except Exception as exc:
             raise RuntimeError(
                 "Could not acquire an Azure token. In Azure, enable managed identity; "
                 "locally, sign in with Azure CLI."
             ) from exc
+    try:
+        return AzureCliCredential(tenant_id=tenant_id or "").get_token(scope).token
+    except Exception:
+        pass
     command = [
         az,
         "account",
@@ -334,6 +338,114 @@ mcp = FastMCP(
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> Response:
     return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/demo", methods=["GET"])
+async def demo(_: Request) -> Response:
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fabric SQL MCP Demo</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f6f7f9; color: #242424; }
+    main { max-width: 960px; margin: 32px auto; padding: 0 20px; }
+    section { background: white; border: 1px solid #ddd; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    input, textarea, button { font: inherit; }
+    input, textarea { width: 100%; box-sizing: border-box; border: 1px solid #aaa; border-radius: 8px; padding: 10px; margin: 6px 0 12px; }
+    textarea { min-height: 84px; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; background: #0f6cbd; color: white; cursor: pointer; margin-right: 8px; }
+    pre { background: #1e1e1e; color: #f5f5f5; padding: 16px; border-radius: 8px; overflow: auto; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Fabric SQL MCP Demo</h1>
+  <p class="muted">Demo NLP query and CSV export against the deployed MCP-backed Fabric SQL service.</p>
+  <section>
+    <label>Bearer token / API key</label>
+    <input id="token" type="password" placeholder="Paste MCP_AUTH_TOKEN" />
+    <label>NLP question</label>
+    <textarea id="question">Which cities sold the most units?</textarea>
+    <button onclick="runNlp()">Run NLP Query</button>
+    <button onclick="exportCsv()">Export 2,000 Rows CSV</button>
+  </section>
+  <section>
+    <h2>Result</h2>
+    <pre id="output">Ready.</pre>
+  </section>
+</main>
+<script>
+  function authHeaders() {
+    const token = document.getElementById('token').value.trim();
+    return { 'content-type': 'application/json', 'authorization': `Bearer ${token}` };
+  }
+  async function runNlp() {
+    const output = document.getElementById('output');
+    output.textContent = 'Running...';
+    const response = await fetch('/demo/query', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ question: document.getElementById('question').value })
+    });
+    output.textContent = JSON.stringify(await response.json(), null, 2);
+  }
+  async function exportCsv() {
+    const output = document.getElementById('output');
+    output.textContent = 'Exporting...';
+    const response = await fetch('/demo/export', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ max_rows: 2000 })
+    });
+    const payload = await response.json();
+    output.textContent = JSON.stringify(payload, null, 2);
+    if (!response.ok) return;
+    const file = await fetch(payload.downloadPath, { headers: authHeaders() });
+    const blob = await file.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = payload.fileName;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+</script>
+</body>
+</html>
+        """
+    )
+
+
+@mcp.custom_route("/demo/query", methods=["POST"])
+async def demo_query(request: Request) -> Response:
+    payload = await request.json()
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    sql = _translate_nlp(question)
+    result = await asyncio.to_thread(_execute_sql, query=sql, max_rows=100)
+    result["question"] = question
+    result["translatedSql"] = sql
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/demo/export", methods=["POST"])
+async def demo_export(request: Request) -> Response:
+    payload = await request.json()
+    max_rows = int(payload.get("max_rows", 2000))
+    query = str(
+        payload.get(
+            "query",
+            "SELECT TOP (2000) * FROM dbo.factsales ORDER BY SaleId",
+        )
+    )
+    result = await asyncio.to_thread(_export_csv, query=query, max_rows=max_rows, page_size=1000)
+    return JSONResponse(result)
 
 
 @mcp.custom_route("/exports/{file_name}", methods=["GET"])
