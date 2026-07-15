@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv
+env
+.git
+.gitignore
+mcp_smoke_test.py
+mcp_endpoint_smoke_test.py

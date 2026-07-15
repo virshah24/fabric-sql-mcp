@@ -1,0 +1,15 @@
+.azure/
+*.log
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+.env
+*.env
+!*.env.example
+Scratchpad/fabric-definitions/
+Scratchpad/fabric-specs/
+Scratchpad/report-debug/
+infra/*.json

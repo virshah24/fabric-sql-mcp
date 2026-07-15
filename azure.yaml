@@ -1,0 +1,13 @@
+name: fabric-sql-mcp
+metadata:
+  template: fabric-sql-mcp@0.0.1
+services:
+  fabric-sql-mcp:
+    project: ./Scratchpad/fabric-sql-mcp
+    language: python
+    host: containerapp
+    docker:
+      path: Dockerfile
+      remoteBuild: true
+infra:
+  provider: bicep
