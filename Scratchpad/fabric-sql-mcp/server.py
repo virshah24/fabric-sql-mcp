@@ -429,6 +429,9 @@ async def demo(_: Request) -> Response:
   </section>
 </main>
 <script>
+  let lastTranslatedSql = null;
+  let lastQuestion = null;
+
   function authHeaders() {
     const token = document.getElementById('token').value.trim();
     return { 'content-type': 'application/json', 'authorization': `Bearer ${token}` };
@@ -441,18 +444,28 @@ async def demo(_: Request) -> Response:
       headers: authHeaders(),
       body: JSON.stringify({ question: document.getElementById('question').value })
     });
-    output.textContent = JSON.stringify(await response.json(), null, 2);
+    const payload = await response.json();
+    if (response.ok && payload.translatedSql) {
+      lastTranslatedSql = payload.translatedSql;
+      lastQuestion = document.getElementById('question').value;
+    }
+    output.textContent = JSON.stringify(payload, null, 2);
   }
   async function exportCsv() {
     const output = document.getElementById('output');
+    const question = document.getElementById('question').value;
     output.textContent = 'Exporting...';
+    const requestBody = {
+      question,
+      max_rows: 2000
+    };
+    if (lastTranslatedSql && lastQuestion === question) {
+      requestBody.query = lastTranslatedSql;
+    }
     const response = await fetch('/demo/export', {
       method: 'POST',
       headers: authHeaders(),
-      body: JSON.stringify({
-        question: document.getElementById('question').value,
-        max_rows: 2000
-      })
+      body: JSON.stringify(requestBody)
     });
     const payload = await response.json();
     output.textContent = JSON.stringify(payload, null, 2);
@@ -469,7 +482,11 @@ async def demo(_: Request) -> Response:
 </script>
 </body>
 </html>
-        """
+        """,
+        headers={
+            "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+            "pragma": "no-cache",
+        },
     )
 
 
@@ -490,14 +507,18 @@ async def demo_query(request: Request) -> Response:
 async def demo_export(request: Request) -> Response:
     payload = await request.json()
     max_rows = int(payload.get("max_rows", 2000))
+    source = "default"
     if payload.get("query"):
         query = str(payload["query"])
+        source = "provided_query"
     elif payload.get("question"):
         query = _translate_nlp(str(payload["question"]))
+        source = "translated_question"
     else:
         query = "SELECT TOP (2000) * FROM dbo.factsales ORDER BY [Date] DESC, SaleId DESC"
     result = await asyncio.to_thread(_export_csv, query=query, max_rows=max_rows, page_size=1000)
     result["translatedSql"] = query
+    result["exportSource"] = source
     return JSONResponse(result)
 
 
