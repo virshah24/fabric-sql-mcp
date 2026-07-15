@@ -5,7 +5,9 @@ from mcp.client.streamable_http import streamablehttp_client
 
 async def main():
     endpoint = os.environ.get("MCP_ENDPOINT", "http://localhost:8000/mcp")
-    async with streamablehttp_client(endpoint) as (read, write, _):
+    token = os.environ.get("MCP_AUTH_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    async with streamablehttp_client(endpoint, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()

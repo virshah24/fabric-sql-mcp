@@ -12,4 +12,8 @@ env/
 Scratchpad/fabric-definitions/
 Scratchpad/fabric-specs/
 Scratchpad/report-debug/
+Scratchpad/fabric-sql-mcp/hardening_smoke_test.py
+Scratchpad/fabric-sql-mcp/remote_unauth_test.py
+Scratchpad/fabric-sql-mcp/remote_export_test.py
+Scratchpad/fabric-sql-mcp/fabric-sql-export-*.csv
 infra/*.json

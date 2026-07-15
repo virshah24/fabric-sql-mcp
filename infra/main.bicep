@@ -18,6 +18,25 @@ param fabricSqlServer string = ''
 @description('Default Fabric SQL database/catalog.')
 param fabricSqlDatabase string = ''
 
+@description('Optional bearer/API key required for remote MCP calls. Leave empty only for trusted POC environments.')
+@secure()
+param mcpAuthToken string = ''
+
+@description('Comma-separated list of allowed browser origins for CORS.')
+param mcpAllowedOrigins string = ''
+
+@description('Per-client request limit per minute.')
+param mcpRateLimitPerMinute string = '60'
+
+@description('Maximum rows returned by non-export SQL query tools.')
+param fabricSqlMaxQueryRows string = '5000'
+
+@description('Maximum rows written by CSV export tools.')
+param fabricSqlMaxExportRows string = '100000'
+
+@description('Maximum rows fetched per CSV export page.')
+param fabricSqlMaxExportPageSize string = '5000'
+
 var normalizedEnvironmentName = toLower(replace(environmentName, '-', ''))
 var resourceToken = take(uniqueString(resourceGroup().id, environmentName), 6)
 var namePrefix = 'fabric-sql-mcp'
@@ -121,6 +140,34 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'FABRIC_SQL_DATABASE'
               value: fabricSqlDatabase
+            }
+            {
+              name: 'MCP_AUTH_TOKEN'
+              value: mcpAuthToken
+            }
+            {
+              name: 'MCP_ALLOWED_ORIGINS'
+              value: mcpAllowedOrigins
+            }
+            {
+              name: 'MCP_RATE_LIMIT_PER_MINUTE'
+              value: mcpRateLimitPerMinute
+            }
+            {
+              name: 'FABRIC_SQL_MAX_QUERY_ROWS'
+              value: fabricSqlMaxQueryRows
+            }
+            {
+              name: 'FABRIC_SQL_MAX_EXPORT_ROWS'
+              value: fabricSqlMaxExportRows
+            }
+            {
+              name: 'FABRIC_SQL_MAX_EXPORT_PAGE_SIZE'
+              value: fabricSqlMaxExportPageSize
+            }
+            {
+              name: 'FABRIC_SQL_EXPORT_DIR'
+              value: '/tmp/fabric-sql-mcp-exports'
             }
           ]
           resources: {

@@ -1,17 +1,28 @@
 import argparse
 import asyncio
+import csv
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
+import time
 import urllib.request
+import uuid
+from collections import defaultdict, deque
+from pathlib import Path
 from typing import Any
 
 import pyodbc
 from azure.identity import AzureCliCredential, DefaultAzureCredential
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, Response
+import uvicorn
 
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
@@ -19,6 +30,44 @@ SQL_COPT_SS_ACCESS_TOKEN = 1256
 DEFAULT_TENANT_ID = ""
 DEFAULT_SERVER = ""
 DEFAULT_DATABASE = ""
+EXPORT_DIR = Path(os.getenv("FABRIC_SQL_EXPORT_DIR", "/tmp/fabric-sql-mcp-exports"))
+DANGEROUS_SQL_PATTERN = re.compile(
+    r"\b(insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|deny|execute|exec|xp_|sp_)\b",
+    re.IGNORECASE,
+)
+_rate_windows: dict[str, deque[float]] = defaultdict(deque)
+_export_lock = asyncio.Semaphore(int(os.getenv("MCP_EXPORT_CONCURRENCY", "1")))
+
+
+class ApiKeyAndRateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: Any, api_key: str = "", rate_limit_per_minute: int = 60) -> None:
+        super().__init__(app)
+        self.api_key = api_key
+        self.rate_limit_per_minute = rate_limit_per_minute
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        if request.method == "OPTIONS" or request.url.path == "/health":
+            return await call_next(request)
+
+        if self.api_key:
+            auth = request.headers.get("authorization", "")
+            api_key = request.headers.get("x-api-key", "")
+            if auth != f"Bearer {self.api_key}" and api_key != self.api_key:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        client = request.client.host if request.client else "unknown"
+        now = time.time()
+        window = _rate_windows[client]
+        while window and now - window[0] > 60:
+            window.popleft()
+        if len(window) >= self.rate_limit_per_minute:
+            return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+        window.append(now)
+
+        request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        response = await call_next(request)
+        response.headers["x-request-id"] = request_id
+        return response
 
 
 def _get_access_token(tenant_id: str, resource: str = "https://database.windows.net/") -> str:
@@ -99,6 +148,27 @@ def _token_struct(access_token: str) -> bytes:
     return struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
 
 
+def _validate_select_query(query: str, *, for_export: bool = False) -> str:
+    stripped = query.strip()
+    if not stripped:
+        raise ValueError("Query is required.")
+    if len(stripped) > int(os.getenv("FABRIC_SQL_MAX_QUERY_CHARS", "20000")):
+        raise ValueError("Query is too large.")
+
+    without_trailing_semicolon = stripped[:-1].strip() if stripped.endswith(";") else stripped
+    if ";" in without_trailing_semicolon:
+        raise ValueError("Multiple SQL statements are not allowed.")
+
+    normalized = without_trailing_semicolon.lower()
+    if not (normalized.startswith("select") or normalized.startswith("with")):
+        raise ValueError("Only read-only SELECT queries are allowed.")
+    if DANGEROUS_SQL_PATTERN.search(without_trailing_semicolon):
+        raise ValueError("Query contains a disallowed SQL keyword.")
+    if not for_export and "information_schema." not in normalized and not re.search(r"\b(top|offset|count\s*\()", normalized):
+        raise ValueError("Interactive queries must include TOP, OFFSET/FETCH, or COUNT. Use export for larger result sets.")
+    return without_trailing_semicolon
+
+
 def _connect(
     database: str | None = None,
     server: str | None = None,
@@ -144,8 +214,8 @@ def _execute_sql(
     workspace_id: str | None = None,
     sql_endpoint_id: str | None = None,
 ) -> dict[str, Any]:
-    if not query.strip().lower().startswith("select"):
-        raise ValueError("Only read-only SELECT queries are allowed.")
+    query = _validate_select_query(query)
+    max_rows = min(max_rows, int(os.getenv("FABRIC_SQL_MAX_QUERY_ROWS", "5000")))
 
     with _connect(
         database=database,
@@ -163,6 +233,55 @@ def _execute_sql(
             "rowCount": len(rows),
             "rows": rows,
         }
+
+
+def _export_csv(
+    query: str,
+    database: str | None = None,
+    max_rows: int = 100000,
+    page_size: int = 1000,
+    server: str | None = None,
+    tenant_id: str | None = None,
+    workspace_id: str | None = None,
+    sql_endpoint_id: str | None = None,
+) -> dict[str, Any]:
+    query = _validate_select_query(query, for_export=True)
+    max_rows = min(max_rows, int(os.getenv("FABRIC_SQL_MAX_EXPORT_ROWS", "100000")))
+    page_size = max(1, min(page_size, int(os.getenv("FABRIC_SQL_MAX_EXPORT_PAGE_SIZE", "5000"))))
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    file_name = f"fabric-sql-export-{uuid.uuid4().hex}.csv"
+    path = EXPORT_DIR / file_name
+
+    row_count = 0
+    with _connect(
+        database=database,
+        server=server,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        sql_endpoint_id=sql_endpoint_id,
+    ) as connection:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [column[0] for column in cursor.description or []]
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            while row_count < max_rows:
+                rows = cursor.fetchmany(min(page_size, max_rows - row_count))
+                if not rows:
+                    break
+                writer.writerows(rows)
+                row_count += len(rows)
+
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    return {
+        "database": database or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE),
+        "rowCount": row_count,
+        "fileName": file_name,
+        "downloadPath": f"/exports/{file_name}",
+        "downloadUrl": f"{public_base_url}/exports/{file_name}" if public_base_url else None,
+        "maxRowsApplied": max_rows,
+    }
 
 
 def _translate_nlp(question: str) -> str:
@@ -212,6 +331,22 @@ mcp = FastMCP(
 )
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_: Request) -> Response:
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/exports/{file_name}", methods=["GET"])
+async def download_export(request: Request) -> Response:
+    file_name = request.path_params["file_name"]
+    if not re.fullmatch(r"fabric-sql-export-[0-9a-f]+\.csv", file_name):
+        return JSONResponse({"error": "Invalid file name"}, status_code=400)
+    path = EXPORT_DIR / file_name
+    if not path.exists():
+        return JSONResponse({"error": "Export not found"}, status_code=404)
+    return FileResponse(path, media_type="text/csv", filename=file_name)
+
+
 @mcp.tool()
 async def fabric_sql_query(query: str, database: str | None = None, max_rows: int = 100) -> dict[str, Any]:
     """Run a read-only SQL query against the configured Fabric SQL endpoint."""
@@ -242,6 +377,43 @@ async def fabric_sql_list_tables(database: str | None = None) -> dict[str, Any]:
         database=database,
         max_rows=500,
     )
+
+
+@mcp.tool()
+async def fabric_sql_export_csv(query: str, database: str | None = None, max_rows: int = 100000, page_size: int = 1000) -> dict[str, Any]:
+    """Export a read-only SQL query to CSV and return export metadata plus a download path."""
+    async with _export_lock:
+        return await asyncio.to_thread(
+            _export_csv,
+            query=query,
+            database=database,
+            max_rows=max_rows,
+            page_size=page_size,
+        )
+
+
+@mcp.tool()
+async def fabric_sql_export_csv_endpoint(
+    query: str,
+    workspace_id: str,
+    sql_endpoint_id: str,
+    database: str,
+    tenant_id: str | None = None,
+    max_rows: int = 100000,
+    page_size: int = 1000,
+) -> dict[str, Any]:
+    """Export a query to CSV from any Fabric SQL endpoint by workspace ID and SQL endpoint item ID."""
+    async with _export_lock:
+        return await asyncio.to_thread(
+            _export_csv,
+            query=query,
+            database=database,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            sql_endpoint_id=sql_endpoint_id,
+            max_rows=max_rows,
+            page_size=page_size,
+        )
 
 
 @mcp.tool()
@@ -332,7 +504,29 @@ def main() -> None:
 
     mcp.settings.host = args.host
     mcp.settings.port = args.port
-    mcp.run(transport=args.transport)
+    if args.transport == "streamable-http":
+        app = mcp.streamable_http_app()
+        app.add_middleware(
+            ApiKeyAndRateLimitMiddleware,
+            api_key=os.getenv("MCP_AUTH_TOKEN", ""),
+            rate_limit_per_minute=int(os.getenv("MCP_RATE_LIMIT_PER_MINUTE", "60")),
+        )
+        allowed_origins = [
+            origin.strip()
+            for origin in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",")
+            if origin.strip()
+        ]
+        if allowed_origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=allowed_origins,
+                allow_credentials=True,
+                allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+                allow_headers=["authorization", "content-type", "mcp-session-id", "x-api-key", "x-request-id"],
+            )
+        uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":
