@@ -59,6 +59,67 @@ The deployed MCP endpoint is exposed at:
 https://<container-app-host>/mcp
 ```
 
+## Obtaining the MCP auth token
+
+The deployed MCP endpoint is protected by a shared bearer/API token. The token is not published in GitHub and should be distributed through a secure channel such as a password manager, Key Vault-backed process, or an approved internal secret-sharing workflow.
+
+### End-user steps
+
+1. Ask the service owner/operator for the current `MCP_AUTH_TOKEN`.
+2. Open the demo UI:
+
+   ```text
+   https://<container-app-host>/demo
+   ```
+
+3. Paste the token into the **Bearer token / API key** field.
+4. Run the NLP query or export workflow.
+
+For direct API/MCP clients, send either header:
+
+```http
+Authorization: Bearer <MCP_AUTH_TOKEN>
+```
+
+or:
+
+```http
+x-api-key: <MCP_AUTH_TOKEN>
+```
+
+### Operator steps: read the local deployment token
+
+If you deployed the app with AZD from this repo, the token is stored in your local AZD environment config:
+
+```powershell
+$cfg = Get-Content -Raw .\.azure\fabric-sql-mcp\config.json | ConvertFrom-Json
+$cfg.infra.parameters.mcpAuthToken | Set-Clipboard
+```
+
+This copies the token to your clipboard without printing it to the terminal.
+
+### Operator steps: rotate the token
+
+Generate and apply a new token:
+
+```powershell
+$token = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 48 | ForEach-Object {[char]$_})
+
+azd env config set infra.parameters.mcpAuthToken $token
+
+az containerapp secret set `
+  --name fabric-sql-mcp-app `
+  --resource-group rg-fabric-sql-mcp `
+  --secrets mcp-auth-token=$token
+
+az containerapp update `
+  --name fabric-sql-mcp-app `
+  --resource-group rg-fabric-sql-mcp `
+  --set-env-vars MCP_AUTH_TOKEN=secretref:mcp-auth-token
+```
+
+After rotation, share the new token only through an approved secure channel.
+
 ## Security
 
 - No SQL passwords are used.
