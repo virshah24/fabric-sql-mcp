@@ -95,7 +95,8 @@ The page lets you:
 
 - enter the MCP bearer/API token,
 - optionally override the Fabric SQL endpoint host and database/catalog,
+- discover the selected database schema and inferred profile,
 - run a sample NLP query,
 - export up to 2,000 rows to CSV through the protected `/demo/export` route.
 
-The demo uses the same server-side guardrails and authentication as the MCP endpoint.
+The demo uses the same server-side guardrails and authentication as the MCP endpoint. When you change endpoint/database, click **Discover Schema** first so the demo can infer whether the selected database uses the sample retail schema or the SalesLT schema.

@@ -11,6 +11,7 @@ import time
 import urllib.request
 import uuid
 from collections import defaultdict, deque
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,28 @@ DANGEROUS_SQL_PATTERN = re.compile(
 )
 _rate_windows: dict[str, deque[float]] = defaultdict(deque)
 _export_lock = asyncio.Semaphore(int(os.getenv("MCP_EXPORT_CONCURRENCY", "1")))
+
+
+def _normalize_database_name(database: str | None) -> str | None:
+    if not database:
+        return database
+    cleaned = database.strip()
+    match = re.match(
+        r"^(?P<name>.+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    return match.group("name") if match else cleaned
+
+
+def _json_safe(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    return value
 
 
 class ApiKeyAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -187,7 +210,7 @@ def _connect(
         sql_endpoint_id=sql_endpoint_id,
         tenant_id=resolved_tenant,
     )
-    resolved_database = database or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE)
+    resolved_database = _normalize_database_name(database) or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE)
     if not resolved_database:
         raise ValueError("Provide database or set FABRIC_SQL_DATABASE.")
     token = _get_access_token(resolved_tenant)
@@ -208,7 +231,7 @@ def _rows_to_dicts(cursor: pyodbc.Cursor, max_rows: int) -> list[dict[str, Any]]
     rows = cursor.fetchmany(max_rows)
     return [
         {
-            column: (value.isoformat() if hasattr(value, "isoformat") else value)
+            column: _json_safe(value)
             for column, value in zip(columns, row)
         }
         for row in rows
@@ -238,7 +261,7 @@ def _execute_sql(
         cursor.execute(query)
         rows = _rows_to_dicts(cursor, max_rows)
         return {
-            "database": database or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE),
+            "database": _normalize_database_name(database) or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE),
             "server": server or os.getenv("FABRIC_SQL_SERVER", DEFAULT_SERVER),
             "rowCount": len(rows),
             "rows": rows,
@@ -285,7 +308,7 @@ def _export_csv(
 
     public_base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     return {
-        "database": database or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE),
+        "database": _normalize_database_name(database) or os.getenv("FABRIC_SQL_DATABASE", DEFAULT_DATABASE),
         "rowCount": row_count,
         "fileName": file_name,
         "downloadPath": f"/exports/{file_name}",
@@ -294,10 +317,84 @@ def _export_csv(
     }
 
 
-def _translate_nlp(question: str) -> str:
+def _discover_schema(
+    database: str | None = None,
+    server: str | None = None,
+    tenant_id: str | None = None,
+    workspace_id: str | None = None,
+    sql_endpoint_id: str | None = None,
+) -> dict[str, Any]:
+    result = _execute_sql(
+        query=(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        ),
+        database=database,
+        server=server,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        sql_endpoint_id=sql_endpoint_id,
+        max_rows=5000,
+    )
+    rows = result["rows"]
+    tables = sorted({f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}" for row in rows})
+    table_set = {table.lower() for table in tables}
+    if {"saleslt.salesorderdetail", "saleslt.salesorderheader"}.issubset(table_set):
+        schema_profile = "saleslt"
+    elif "dbo.factsales" in table_set:
+        schema_profile = "retail"
+    else:
+        schema_profile = "generic"
+    return {
+        "database": result["database"],
+        "server": result["server"],
+        "schemaProfile": schema_profile,
+        "tableCount": len(tables),
+        "columnCount": len(rows),
+        "tables": tables,
+        "columns": rows,
+    }
+
+
+def _translate_nlp(question: str, database: str | None = None, schema_profile: str | None = None) -> str:
     normalized = question.lower()
+    normalized_database = (_normalize_database_name(database) or os.getenv("FABRIC_SQL_DATABASE", "")).lower()
+    normalized_profile = (schema_profile or "").lower()
     top_match = re.search(r"\b(?:top|last|latest)\s+(\d{1,5})\b", normalized)
     top_n = min(int(top_match.group(1)), 5000) if top_match else 10
+
+    if normalized_profile == "saleslt" or normalized_database == "fabsqldb1":
+        if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table", "order detail", "sales")) and any(
+            term in normalized for term in ("last", "latest", "recent", "show")
+        ):
+            return (
+                f"SELECT TOP ({top_n}) h.SalesOrderID, d.SalesOrderDetailID, h.OrderDate, h.CustomerID, "
+                "d.ProductID, p.Name AS ProductName, d.OrderQty, d.UnitPrice, d.UnitPriceDiscount, "
+                "CAST(d.OrderQty * d.UnitPrice * (1 - d.UnitPriceDiscount) AS decimal(18,2)) AS LineSalesAmount "
+                "FROM SalesLT.SalesOrderDetail d "
+                "JOIN SalesLT.SalesOrderHeader h ON d.SalesOrderID = h.SalesOrderID "
+                "LEFT JOIN SalesLT.Product p ON d.ProductID = p.ProductID "
+                "ORDER BY h.OrderDate DESC, h.SalesOrderID DESC, d.SalesOrderDetailID DESC"
+            )
+        if "product" in normalized or "goods" in normalized or "sku" in normalized:
+            metric = "SUM(d.OrderQty)" if any(term in normalized for term in ("unit", "quantity", "sold")) else "SUM(d.OrderQty * d.UnitPrice * (1 - d.UnitPriceDiscount))"
+            alias = "UnitsSold" if "SUM(d.OrderQty)" in metric else "SalesAmount"
+            direction = "ASC" if any(term in normalized for term in ("bottom", "lowest", "least", "worst")) else "DESC"
+            return (
+                f"SELECT TOP ({top_n}) p.Name AS ProductName, {metric} AS {alias} "
+                "FROM SalesLT.SalesOrderDetail d "
+                "LEFT JOIN SalesLT.Product p ON d.ProductID = p.ProductID "
+                "GROUP BY p.Name "
+                f"ORDER BY {alias} {direction}"
+            )
+        if "summary" in normalized or "total" in normalized or "overall" in normalized:
+            return (
+                "SELECT COUNT_BIG(*) AS TransactionLineCount, SUM(d.OrderQty) AS UnitsSold, "
+                "CAST(SUM(d.OrderQty * d.UnitPrice * (1 - d.UnitPriceDiscount)) AS decimal(18,2)) AS SalesAmount, "
+                "CAST(AVG(d.UnitPrice) AS decimal(18,2)) AS AvgUnitPrice "
+                "FROM SalesLT.SalesOrderDetail d"
+            )
 
     if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table")) and any(
         term in normalized for term in ("last", "latest", "recent", "show")
@@ -424,6 +521,7 @@ async def demo(_: Request) -> Response:
     <input id="database" placeholder="Use database configured on deployment" />
     <label>NLP question</label>
     <textarea id="question">Which cities sold the most units?</textarea>
+    <button onclick="discoverSchema()">Discover Schema</button>
     <button onclick="runNlp()">Run NLP Query</button>
     <button onclick="exportCsv()">Export Current Question CSV</button>
   </section>
@@ -435,23 +533,46 @@ async def demo(_: Request) -> Response:
 <script>
   let lastTranslatedSql = null;
   let lastQuestion = null;
+  let schemaProfile = null;
 
   function authHeaders() {
     const token = document.getElementById('token').value.trim();
     return { 'content-type': 'application/json', 'authorization': `Bearer ${token}` };
   }
+  function connectionPayload() {
+    const server = document.getElementById('server').value.trim();
+    const database = document.getElementById('database').value.trim();
+    return {
+      server: server || null,
+      database: database || null,
+      schemaProfile: schemaProfile || null
+    };
+  }
+  async function discoverSchema() {
+    const output = document.getElementById('output');
+    output.textContent = 'Discovering schema...';
+    const response = await fetch('/demo/discover', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(connectionPayload())
+    });
+    const payload = await response.json();
+    if (response.ok) {
+      schemaProfile = payload.schemaProfile;
+      lastTranslatedSql = null;
+      lastQuestion = null;
+    }
+    output.textContent = JSON.stringify(payload, null, 2);
+  }
   async function runNlp() {
     const output = document.getElementById('output');
     output.textContent = 'Running...';
-    const server = document.getElementById('server').value.trim();
-    const database = document.getElementById('database').value.trim();
     const response = await fetch('/demo/query', {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({
         question: document.getElementById('question').value,
-        server: server || null,
-        database: database || null
+        ...connectionPayload()
       })
     });
     const payload = await response.json();
@@ -464,14 +585,11 @@ async def demo(_: Request) -> Response:
   async function exportCsv() {
     const output = document.getElementById('output');
     const question = document.getElementById('question').value;
-    const server = document.getElementById('server').value.trim();
-    const database = document.getElementById('database').value.trim();
     output.textContent = 'Exporting...';
     const requestBody = {
       question,
       max_rows: 2000,
-      server: server || null,
-      database: database || null
+      ...connectionPayload()
     };
     if (lastTranslatedSql && lastQuestion === question) {
       requestBody.query = lastTranslatedSql;
@@ -504,51 +622,76 @@ async def demo(_: Request) -> Response:
     )
 
 
+@mcp.custom_route("/demo/discover", methods=["POST"])
+async def demo_discover(request: Request) -> Response:
+    try:
+        payload = await request.json()
+        result = await asyncio.to_thread(
+            _discover_schema,
+            database=payload.get("database"),
+            server=payload.get("server"),
+            tenant_id=payload.get("tenant_id"),
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 @mcp.custom_route("/demo/query", methods=["POST"])
 async def demo_query(request: Request) -> Response:
-    payload = await request.json()
-    question = str(payload.get("question", "")).strip()
-    if not question:
-        return JSONResponse({"error": "question is required"}, status_code=400)
-    sql = _translate_nlp(question)
-    result = await asyncio.to_thread(
-        _execute_sql,
-        query=sql,
-        database=payload.get("database"),
-        server=payload.get("server"),
-        tenant_id=payload.get("tenant_id"),
-        max_rows=100,
-    )
-    result["question"] = question
-    result["translatedSql"] = sql
-    return JSONResponse(result)
+    try:
+        payload = await request.json()
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            return JSONResponse({"error": "question is required"}, status_code=400)
+        sql = _translate_nlp(question, database=payload.get("database"), schema_profile=payload.get("schemaProfile"))
+        result = await asyncio.to_thread(
+            _execute_sql,
+            query=sql,
+            database=payload.get("database"),
+            server=payload.get("server"),
+            tenant_id=payload.get("tenant_id"),
+            max_rows=100,
+        )
+        result["question"] = question
+        result["translatedSql"] = sql
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @mcp.custom_route("/demo/export", methods=["POST"])
 async def demo_export(request: Request) -> Response:
-    payload = await request.json()
-    max_rows = int(payload.get("max_rows", 2000))
-    source = "default"
-    if payload.get("query"):
-        query = str(payload["query"])
-        source = "provided_query"
-    elif payload.get("question"):
-        query = _translate_nlp(str(payload["question"]))
-        source = "translated_question"
-    else:
-        query = "SELECT TOP (2000) * FROM dbo.factsales ORDER BY [Date] DESC, SaleId DESC"
-    result = await asyncio.to_thread(
-        _export_csv,
-        query=query,
-        database=payload.get("database"),
-        server=payload.get("server"),
-        tenant_id=payload.get("tenant_id"),
-        max_rows=max_rows,
-        page_size=1000,
-    )
-    result["translatedSql"] = query
-    result["exportSource"] = source
-    return JSONResponse(result)
+    try:
+        payload = await request.json()
+        max_rows = int(payload.get("max_rows", 2000))
+        source = "default"
+        if payload.get("query"):
+            query = str(payload["query"])
+            source = "provided_query"
+        elif payload.get("question"):
+            query = _translate_nlp(
+                str(payload["question"]),
+                database=payload.get("database"),
+                schema_profile=payload.get("schemaProfile"),
+            )
+            source = "translated_question"
+        else:
+            query = "SELECT TOP (2000) * FROM dbo.factsales ORDER BY [Date] DESC, SaleId DESC"
+        result = await asyncio.to_thread(
+            _export_csv,
+            query=query,
+            database=payload.get("database"),
+            server=payload.get("server"),
+            tenant_id=payload.get("tenant_id"),
+            max_rows=max_rows,
+            page_size=1000,
+        )
+        result["translatedSql"] = query
+        result["exportSource"] = source
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @mcp.custom_route("/exports/{file_name}", methods=["GET"])
@@ -571,7 +714,7 @@ async def fabric_sql_query(query: str, database: str | None = None, max_rows: in
 @mcp.tool()
 async def fabric_sql_nlp_query(question: str, database: str | None = None, max_rows: int = 100) -> dict[str, Any]:
     """Translate a simple retail NLP question to SQL and run it against Fabric SQL."""
-    sql = _translate_nlp(question)
+    sql = _translate_nlp(question, database=database)
     result = await asyncio.to_thread(_execute_sql, query=sql, database=database, max_rows=max_rows)
     result["question"] = question
     result["translatedSql"] = sql
@@ -662,7 +805,7 @@ async def fabric_sql_nlp_query_endpoint(
     max_rows: int = 100,
 ) -> dict[str, Any]:
     """Translate a simple retail NLP question and run it against any Fabric SQL endpoint."""
-    sql = _translate_nlp(question)
+    sql = _translate_nlp(question, database=database)
     result = await asyncio.to_thread(
         _execute_sql,
         query=sql,
