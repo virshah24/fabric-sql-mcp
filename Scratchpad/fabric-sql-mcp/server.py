@@ -399,12 +399,30 @@ def _translate_nlp(question: str, database: str | None = None, schema_profile: s
             )
 
     if normalized_profile == "trip":
+        distance_filter = ""
+        distance_match = re.search(
+            r"\b(?:more than|over|greater than|above|at least|>=|>)\s*(\d+(?:\.\d+)?)\s*(?:mile|miles|mi)\b",
+            normalized,
+        )
+        if distance_match:
+            operator = ">=" if any(term in normalized for term in ("at least", ">=")) else ">"
+            distance_filter = f"WHERE t.TripDistanceMiles {operator} {float(distance_match.group(1))} "
+        else:
+            distance_match = re.search(
+                r"\b(?:less than|under|below|at most|<=|<)\s*(\d+(?:\.\d+)?)\s*(?:mile|miles|mi)\b",
+                normalized,
+            )
+            if distance_match:
+                operator = "<=" if any(term in normalized for term in ("at most", "<=")) else "<"
+                distance_filter = f"WHERE t.TripDistanceMiles {operator} {float(distance_match.group(1))} "
+
         if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table", "trip", "trips", "ride", "rides")) and any(
             term in normalized for term in ("last", "latest", "recent", "show")
         ):
             return (
                 f"SELECT TOP ({top_n}) t.* "
                 "FROM dbo.Trip t "
+                f"{distance_filter}"
                 "ORDER BY t.DateID DESC"
             )
         if "summary" in normalized or "total" in normalized or "overall" in normalized:
@@ -413,19 +431,22 @@ def _translate_nlp(question: str, database: str | None = None, schema_profile: s
                 "CAST(SUM(t.FareAmount) AS decimal(18,2)) AS FareAmount, "
                 "CAST(SUM(t.TotalAmount) AS decimal(18,2)) AS TotalAmount, "
                 "CAST(AVG(t.TotalAmount) AS decimal(18,2)) AS AvgTotalAmount "
-                "FROM dbo.Trip t"
+                "FROM dbo.Trip t "
+                f"{distance_filter}".rstrip()
             )
         if "date" in normalized or "day" in normalized or "daily" in normalized:
             return (
                 f"SELECT TOP ({top_n}) t.DateID, COUNT_BIG(*) AS TripCount, "
                 "CAST(SUM(t.TotalAmount) AS decimal(18,2)) AS TotalAmount "
                 "FROM dbo.Trip t "
+                f"{distance_filter}"
                 "GROUP BY t.DateID "
                 "ORDER BY t.DateID DESC"
             )
         return (
             f"SELECT TOP ({top_n}) t.* "
             "FROM dbo.Trip t "
+            f"{distance_filter}"
             "ORDER BY t.DateID DESC"
         )
 
