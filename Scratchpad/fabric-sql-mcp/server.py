@@ -574,7 +574,7 @@ async def demo(_: Request) -> Response:
     <label>Database / catalog</label>
     <input id="database" placeholder="Use database configured on deployment" />
     <label>NLP question</label>
-    <textarea id="question">Which cities sold the most units?</textarea>
+    <textarea id="question">Show me last 1500 trips that traveled more than 5 miles?</textarea>
     <button onclick="discoverSchema()">Discover Schema</button>
     <button onclick="runNlp()">Run NLP Query</button>
     <button onclick="exportCsv()">Export Current Question CSV</button>
