@@ -362,7 +362,7 @@ def _discover_schema(
 def _translate_nlp(question: str, database: str | None = None, schema_profile: str | None = None) -> str:
     normalized = question.lower()
     normalized_database = (_normalize_database_name(database) or os.getenv("FABRIC_SQL_DATABASE", "")).lower()
-    normalized_profile = (schema_profile or "").lower()
+    normalized_profile = (schema_profile or os.getenv("FABRIC_SQL_SCHEMA_PROFILE", "")).lower()
     top_match = re.search(r"\b(?:top|last|latest)\s+(\d{1,5})\b", normalized)
     top_n = min(int(top_match.group(1)), 5000) if top_match else 10
 

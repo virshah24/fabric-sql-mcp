@@ -18,6 +18,9 @@ param fabricSqlServer string = ''
 @description('Default Fabric SQL database/catalog.')
 param fabricSqlDatabase string = ''
 
+@description('Optional default schema profile for NLP translation.')
+param fabricSqlSchemaProfile string = ''
+
 @description('Optional bearer/API key required for remote MCP calls. Leave empty only for trusted POC environments.')
 @secure()
 param mcpAuthToken string = ''
@@ -140,6 +143,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'FABRIC_SQL_DATABASE'
               value: fabricSqlDatabase
+            }
+            {
+              name: 'FABRIC_SQL_SCHEMA_PROFILE'
+              value: fabricSqlSchemaProfile
             }
             {
               name: 'MCP_AUTH_TOKEN'
