@@ -338,12 +338,14 @@ def _discover_schema(
         max_rows=5000,
     )
     rows = result["rows"]
-    tables = sorted({f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}" for row in rows})
-    table_set = {table.lower() for table in tables}
+    tables = sorted({f"{str(row['TABLE_SCHEMA']).strip()}.{str(row['TABLE_NAME']).strip()}" for row in rows})
+    table_set = {table.strip().lower() for table in tables}
     if {"saleslt.salesorderdetail", "saleslt.salesorderheader"}.issubset(table_set):
         schema_profile = "saleslt"
     elif "dbo.factsales" in table_set:
         schema_profile = "retail"
+    elif "dbo.trip" in table_set or any(table.endswith(".trip") for table in table_set):
+        schema_profile = "trip"
     else:
         schema_profile = "generic"
     return {
@@ -395,6 +397,37 @@ def _translate_nlp(question: str, database: str | None = None, schema_profile: s
                 "CAST(AVG(d.UnitPrice) AS decimal(18,2)) AS AvgUnitPrice "
                 "FROM SalesLT.SalesOrderDetail d"
             )
+
+    if normalized_profile == "trip":
+        if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table", "trip", "trips", "ride", "rides")) and any(
+            term in normalized for term in ("last", "latest", "recent", "show")
+        ):
+            return (
+                f"SELECT TOP ({top_n}) t.* "
+                "FROM dbo.Trip t "
+                "ORDER BY t.DateID DESC"
+            )
+        if "summary" in normalized or "total" in normalized or "overall" in normalized:
+            return (
+                "SELECT COUNT_BIG(*) AS TripCount, "
+                "CAST(SUM(t.FareAmount) AS decimal(18,2)) AS FareAmount, "
+                "CAST(SUM(t.TotalAmount) AS decimal(18,2)) AS TotalAmount, "
+                "CAST(AVG(t.TotalAmount) AS decimal(18,2)) AS AvgTotalAmount "
+                "FROM dbo.Trip t"
+            )
+        if "date" in normalized or "day" in normalized or "daily" in normalized:
+            return (
+                f"SELECT TOP ({top_n}) t.DateID, COUNT_BIG(*) AS TripCount, "
+                "CAST(SUM(t.TotalAmount) AS decimal(18,2)) AS TotalAmount "
+                "FROM dbo.Trip t "
+                "GROUP BY t.DateID "
+                "ORDER BY t.DateID DESC"
+            )
+        return (
+            f"SELECT TOP ({top_n}) t.* "
+            "FROM dbo.Trip t "
+            "ORDER BY t.DateID DESC"
+        )
 
     if any(term in normalized for term in ("transaction", "transactions", "sales rows", "sales table")) and any(
         term in normalized for term in ("last", "latest", "recent", "show")
@@ -483,7 +516,7 @@ mcp = FastMCP(
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> Response:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "version": "schema-discovery-trip-v2"})
 
 
 @mcp.custom_route("/demo", methods=["GET"])
